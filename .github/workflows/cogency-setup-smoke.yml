@@ -4,7 +4,9 @@ name: cogency setup smoke (v0.2)
 # The cogency-verify Action only runs `cogency verify`; this workflow installs
 # the binary directly, runs each `cogency setup <agent>` variant, and asserts
 # that the skill files, symlinks, and hook config entries land where ADR-0022
-# requires.
+# requires. v0.2.1 added per-agent input/output decoding for Codex's
+# apply_patch tool (ADR-0023 / ADR-0024); the apply_patch assertions below
+# cover the Codex transport that v0.2.0 silently dropped.
 
 on:
   push:
@@ -15,13 +17,13 @@ jobs:
   setup-smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
-      - name: Install cogency v0.2.0 binary
+      - name: Install cogency v0.2.1 binary
         shell: bash
         run: |
           set -euo pipefail
-          TAG="v0.2.0"
+          TAG="v0.2.1"
           URL="https://github.com/haru0416-dev/cogency/releases/download/${TAG}/cogency-x86_64-unknown-linux-gnu.tar.xz"
           tmp=$(mktemp -d)
           curl -fsSL "${URL}" -o "${tmp}/cogency.tar.xz"
@@ -62,7 +64,8 @@ jobs:
           set -euo pipefail
           test -f .claude/settings.json
           grep -q "cogency hook pre-tool-use" .claude/settings.json
-          grep -q "Edit|Write|MultiEdit" .claude/settings.json
+          # v0.2.1 matcher: Edit|Write|MultiEdit|apply_patch per ADR-0023.
+          grep -q "Edit|Write|MultiEdit|apply_patch" .claude/settings.json
 
       - name: Assert Codex config.toml carries the cogency hook
         shell: bash
@@ -71,6 +74,7 @@ jobs:
           test -f .codex/config.toml
           grep -q "cogency hook pre-tool-use" .codex/config.toml
           grep -q "PreToolUse" .codex/config.toml
+          grep -q "apply_patch" .codex/config.toml
 
       - name: Assert Cursor rules carry globs frontmatter
         shell: bash
@@ -82,7 +86,7 @@ jobs:
           grep -q "alwaysApply: false" .cursor/rules/cogency-version-sensitive-guard.mdc
           grep -q "globs:" .cursor/rules/cogency-version-sensitive-guard.mdc
 
-      - name: Hook fires advisory on version-sensitive path
+      - name: Hook fires advisory on Claude Edit of Cargo.toml
         shell: bash
         run: |
           set -euo pipefail
@@ -92,7 +96,7 @@ jobs:
           echo "${out}"
           echo "${out}" | grep -q "version-sensitive"
 
-      - name: Hook stays silent on non-sensitive path
+      - name: Hook stays silent on Claude Edit of non-sensitive path
         shell: bash
         run: |
           set -euo pipefail
@@ -100,6 +104,30 @@ jobs:
             | cogency hook pre-tool-use 2>&1 \
             || true)
           test -z "${out}"
+
+      - name: Hook fires Codex additionalContext on apply_patch of Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ADR-0023: handler decodes apply_patch payloads.
+          # ADR-0024: Codex transport emits hookSpecificOutput.additionalContext
+          # on stdout (stderr at exit 0 is disregarded by Codex). Use
+          # `printf '%s'` so the embedded \n stays a JSON escape rather than
+          # expanding into a real newline.
+          payload='{"hook_event_name":"PreToolUse","tool_name":"apply_patch","tool_input":{"command":"*** Begin Patch\n*** Update File: Cargo.toml\n*** End Patch\n"}}'
+          stdout=$(printf '%s' "$payload" | cogency hook pre-tool-use 2>/dev/null)
+          echo "${stdout}"
+          echo "${stdout}" | grep -q '"hookEventName":"PreToolUse"'
+          echo "${stdout}" | grep -q '"additionalContext"'
+          echo "${stdout}" | grep -q "version-sensitive"
+
+      - name: Hook stays silent on Codex apply_patch of non-sensitive path
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload='{"hook_event_name":"PreToolUse","tool_name":"apply_patch","tool_input":{"command":"*** Begin Patch\n*** Add File: src/main.rs\n+fn main() {}\n*** End Patch\n"}}'
+          stdout=$(printf '%s' "$payload" | cogency hook pre-tool-use 2>/dev/null)
+          test -z "${stdout}"
 
       - name: Idempotency check on second setup run
         shell: bash
