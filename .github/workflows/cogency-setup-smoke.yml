@@ -1,0 +1,116 @@
+name: cogency setup smoke (v0.2)
+
+# Exercises the v0.2 per-agent setup surfaces beyond what the Action covers.
+# The cogency-verify Action only runs `cogency verify`; this workflow installs
+# the binary directly, runs each `cogency setup <agent>` variant, and asserts
+# that the skill files, symlinks, and hook config entries land where ADR-0022
+# requires.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  setup-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install cogency v0.2.0 binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v0.2.0"
+          URL="https://github.com/haru0416-dev/cogency/releases/download/${TAG}/cogency-x86_64-unknown-linux-gnu.tar.xz"
+          tmp=$(mktemp -d)
+          curl -fsSL "${URL}" -o "${tmp}/cogency.tar.xz"
+          tar -xJf "${tmp}/cogency.tar.xz" -C "${tmp}"
+          echo "${tmp}/cogency-x86_64-unknown-linux-gnu" >> "${GITHUB_PATH}"
+          "${tmp}/cogency-x86_64-unknown-linux-gnu/cogency" --version
+
+      - name: Setup all four agents
+        shell: bash
+        run: |
+          set -euo pipefail
+          cogency setup agents
+          cogency setup claude
+          cogency setup codex
+          cogency setup cursor
+
+      - name: Assert canonical skill bodies installed
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .agents/skills/cogency-version-sensitive-guard/SKILL.md
+          test -f .agents/skills/cogency-claim-record-author/SKILL.md
+          test -f .agents/skills/cogency-pre-commit-discipline/SKILL.md
+
+      - name: Assert Claude Code symlinks point at canonical bodies
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -L .claude/skills/cogency-version-sensitive-guard
+          test -L .claude/skills/cogency-claim-record-author
+          test -L .claude/skills/cogency-pre-commit-discipline
+          # Following the symlink must reach a regular file.
+          test -f "$(readlink -f .claude/skills/cogency-version-sensitive-guard)/SKILL.md"
+
+      - name: Assert Claude Code settings.json carries the cogency hook
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .claude/settings.json
+          grep -q "cogency hook pre-tool-use" .claude/settings.json
+          grep -q "Edit|Write|MultiEdit" .claude/settings.json
+
+      - name: Assert Codex config.toml carries the cogency hook
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .codex/config.toml
+          grep -q "cogency hook pre-tool-use" .codex/config.toml
+          grep -q "PreToolUse" .codex/config.toml
+
+      - name: Assert Cursor rules carry globs frontmatter
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .cursor/rules/cogency-version-sensitive-guard.mdc
+          test -f .cursor/rules/cogency-claim-record-author.mdc
+          test -f .cursor/rules/cogency-pre-commit-discipline.mdc
+          grep -q "alwaysApply: false" .cursor/rules/cogency-version-sensitive-guard.mdc
+          grep -q "globs:" .cursor/rules/cogency-version-sensitive-guard.mdc
+
+      - name: Hook fires advisory on version-sensitive path
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=$(printf '{"tool_name":"Edit","tool_input":{"file_path":"Cargo.toml"}}' \
+            | cogency hook pre-tool-use 2>&1 \
+            || true)
+          echo "${out}"
+          echo "${out}" | grep -q "version-sensitive"
+
+      - name: Hook stays silent on non-sensitive path
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=$(printf '{"tool_name":"Edit","tool_input":{"file_path":"src/main.rs"}}' \
+            | cogency hook pre-tool-use 2>&1 \
+            || true)
+          test -z "${out}"
+
+      - name: Idempotency check on second setup run
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Capture .claude/settings.json digest before, run setup again, compare.
+          before=$(sha256sum .claude/settings.json | awk '{print $1}')
+          cogency setup claude
+          after=$(sha256sum .claude/settings.json | awk '{print $1}')
+          if [ "${before}" != "${after}" ]; then
+            echo "second cogency setup claude run mutated settings.json"
+            diff <(echo "${before}") <(echo "${after}") || true
+            exit 1
+          fi
